@@ -6,8 +6,12 @@
 #include <pcl/segmentation/extract_clusters.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/common/transforms.h>
+#include <pcl/registration/icp.h>
 #include <Eigen/Dense>
 #include <tf2_eigen/tf2_eigen.h>
+#include <cstdlib>
+#include <cmath>
+#include <algorithm>
 
 TrashDetector::TrashDetector(ros::NodeHandle &nh)
     : nh_(nh), tf_listener_(tf_buffer_)
@@ -15,7 +19,9 @@ TrashDetector::TrashDetector(ros::NodeHandle &nh)
     loadParameters();
     cloud_sub_ = nh_.subscribe("/xtion/depth_registered/points", 1, &TrashDetector::cloudCallback, this);
     service_srv_ = nh_.advertiseService("detect_trash", &TrashDetector::serviceCallback, this);
+    trash_can_srv_ = nh_.advertiseService("detect_trash_can", &TrashDetector::trashCanServiceCallback, this);
     marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("trash_markers", 1);
+    trash_can_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("trash_can", 1);
 }
 
 void TrashDetector::loadParameters()
@@ -42,6 +48,15 @@ void TrashDetector::loadParameters()
     pnh.param("final_filter/max_side_length", max_side_length_, 2.0);
     pnh.param("final_filter/min_height", min_height_, 0.1);
     pnh.param("final_filter/max_height", max_height_, 2.0);
+
+    // Trash can detection parameters
+    pnh.param("trash_can/height", trash_can_height_, 1.0);
+    pnh.param("trash_can/bottom_radius", trash_can_bottom_radius_, 0.2);
+    pnh.param("trash_can/top_radius", trash_can_top_radius_, 0.3);
+
+    // ICP parameters for trash can detection
+    pnh.param("icp/max_iterations", icp_max_iterations_, 50);
+    pnh.param("icp/transformation_epsilon", icp_transformation_epsilon_, 1e-8);
 }
 
 void TrashDetector::cloudCallback(const sensor_msgs::PointCloud2ConstPtr& cloud_msg)
@@ -226,6 +241,226 @@ bool TrashDetector::serviceCallback(trash_detector_interfaces::DetectTrash::Requ
         marker.color.r = 1.0;
         marker.color.g = 0.0;
         marker.color.b = 0.0;
+
+        marker_array.markers.push_back(marker);
+    }
+
+    marker_pub_.publish(marker_array);
+    res.markers = marker_array;
+    return true;
+}
+
+bool TrashDetector::trashCanServiceCallback(trash_detector_interfaces::DetectTrash::Request& req,
+                                              trash_detector_interfaces::DetectTrash::Response& res)
+{
+    if (!latest_cloud_) {
+        ROS_WARN("No point cloud received yet.");
+        return false;
+    }
+
+    // Lookup transform from cloud frame to base_frame.
+    geometry_msgs::TransformStamped transformStamped;
+    try {
+        transformStamped = tf_buffer_.lookupTransform(base_frame_, latest_cloud_->header.frame_id,
+                                                      ros::Time(0), ros::Duration(1.0));
+    } catch (tf2::TransformException &ex) {
+        ROS_ERROR("lookupTransform failed: %s", ex.what());
+        return false;
+    }
+
+    // Convert incoming cloud to PCL.
+    pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::fromROSMsg(*latest_cloud_, *pcl_cloud);
+
+    // Convert geometry_msgs::Transform to Eigen::Isometry3d manually.
+    Eigen::Isometry3d eigen_transform = Eigen::Isometry3d::Identity();
+    eigen_transform.translate(Eigen::Vector3d(
+        transformStamped.transform.translation.x,
+        transformStamped.transform.translation.y,
+        transformStamped.transform.translation.z));
+    Eigen::Quaterniond q(
+        transformStamped.transform.rotation.w,
+        transformStamped.transform.rotation.x,
+        transformStamped.transform.rotation.y,
+        transformStamped.transform.rotation.z);
+    eigen_transform.rotate(q);
+    Eigen::Matrix4f transform = eigen_transform.matrix().cast<float>();
+    pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud_transformed(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::transformPointCloud(*pcl_cloud, *pcl_cloud_transformed, transform);
+
+    // Crop the cloud using a bounding box.
+    pcl::CropBox<pcl::PointXYZ> crop;
+    crop.setMin(Eigen::Vector4f(bb_min_x_, bb_min_y_, bb_min_z_, 1.0));
+    crop.setMax(Eigen::Vector4f(bb_max_x_, bb_max_y_, bb_max_z_, 1.0));
+    crop.setInputCloud(pcl_cloud_transformed);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cropped_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    crop.filter(*cropped_cloud);
+
+    // Optionally remove floor via RANSAC.
+    pcl::PointCloud<pcl::PointXYZ>::Ptr no_floor_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    if (use_ransac_) {
+        pcl::SACSegmentation<pcl::PointXYZ> seg;
+        pcl::PointIndices::Ptr inliers(new pcl::PointIndices());
+        pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients());
+        seg.setOptimizeCoefficients(true);
+        seg.setModelType(pcl::SACMODEL_PLANE);
+        seg.setMethodType(pcl::SAC_RANSAC);
+        seg.setDistanceThreshold(ransac_distance_threshold_);
+        seg.setMaxIterations(ransac_max_iterations_);
+        seg.setInputCloud(cropped_cloud);
+        seg.segment(*inliers, *coefficients);
+        if (inliers->indices.empty()) {
+            ROS_WARN("No floor plane found.");
+            no_floor_cloud = cropped_cloud;
+        } else {
+            pcl::ExtractIndices<pcl::PointXYZ> extract;
+            extract.setInputCloud(cropped_cloud);
+            extract.setIndices(inliers);
+            extract.setNegative(true);
+            extract.filter(*no_floor_cloud);
+        }
+    } else {
+        no_floor_cloud = cropped_cloud;
+    }
+
+    // Cluster extraction using Euclidean clustering.
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>());
+    tree->setInputCloud(no_floor_cloud);
+    std::vector<pcl::PointIndices> cluster_indices;
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+    ec.setClusterTolerance(cluster_tolerance_);
+    ec.setMinClusterSize(min_cluster_size_);
+    ec.setMaxClusterSize(max_cluster_size_);
+    ec.setSearchMethod(tree);
+    ec.setInputCloud(no_floor_cloud);
+    ec.extract(cluster_indices);
+
+    // Generate synthetic model point cloud for the expected trash can.
+    pcl::PointCloud<pcl::PointXYZ>::Ptr model_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    int num_z = 20;   // number of layers along height
+    int num_theta = 36; // points per layer
+    for (int i = 0; i < num_z; i++) {
+        double t = static_cast<double>(i) / (num_z - 1);
+        double z = t * trash_can_height_;
+        double radius = trash_can_bottom_radius_ + t * (trash_can_top_radius_ - trash_can_bottom_radius_);
+        for (int j = 0; j < num_theta; j++) {
+            double theta = 2 * M_PI * j / num_theta;
+            pcl::PointXYZ pt;
+            pt.x = radius * cos(theta);
+            pt.y = radius * sin(theta);
+            pt.z = z;
+            model_cloud->points.push_back(pt);
+        }
+    }
+
+    double best_fitness = std::numeric_limits<double>::max();
+    Eigen::Matrix4f best_transform = Eigen::Matrix4f::Identity();
+    pcl::PointCloud<pcl::PointXYZ>::Ptr best_cluster(new pcl::PointCloud<pcl::PointXYZ>());
+    
+    std::vector<double> icp_corr_distances = {0.3, 0.1, 0.05, 0.02};
+    
+    for (const auto& indices : cluster_indices) {
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::copyPointCloud(*no_floor_cloud, indices, *cluster);
+        if (cluster->empty())
+            continue;
+    
+        // Initial centroid alignment, ensuring trashcan base on ground (z=0)
+        Eigen::Vector4f centroid;
+        pcl::compute3DCentroid(*cluster, centroid);
+        centroid[2] = 0.0;  // Trashcan stands on the ground
+        Eigen::Matrix4f transform_icp = Eigen::Matrix4f::Identity();
+        transform_icp.block<3,1>(0,3) = centroid.head<3>();
+    
+        pcl::PointCloud<pcl::PointXYZ>::Ptr model_cloud_transformed(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::transformPointCloud(*model_cloud, *model_cloud_transformed, transform_icp);
+    
+        // Multi-scale ICP loop
+        Eigen::Matrix4f accumulated_transform = Eigen::Matrix4f::Identity();
+        double fitness = std::numeric_limits<double>::max();
+        bool converged = true;
+    
+        for (double corr_dist : icp_corr_distances) {
+            pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+            icp.setInputSource(model_cloud_transformed);
+            icp.setInputTarget(cluster);
+            icp.setMaximumIterations(icp_max_iterations_);
+            icp.setTransformationEpsilon(icp_transformation_epsilon_);
+            icp.setMaxCorrespondenceDistance(corr_dist);
+    
+            pcl::PointCloud<pcl::PointXYZ> aligned;
+            icp.align(aligned);
+    
+            if (!icp.hasConverged()) {
+                converged = false;
+                break;
+            }
+    
+            fitness = icp.getFitnessScore();
+            accumulated_transform = icp.getFinalTransformation() * accumulated_transform;
+            pcl::transformPointCloud(*model_cloud_transformed, *model_cloud_transformed, icp.getFinalTransformation());
+        }
+    
+        if (converged && fitness < best_fitness) {
+            best_fitness = fitness;
+            best_cluster = cluster;
+            best_transform = accumulated_transform * transform_icp;
+        }
+    }
+    
+    Eigen::Vector3f translation = best_transform.block<3,1>(0,3);
+    Eigen::Matrix3f rotation = best_transform.block<3,3>(0,0);
+    float yaw = rotation.eulerAngles(0, 1, 2)[2];  // yaw from rotation around Z
+
+    Eigen::Affine3f upright_transform = Eigen::Affine3f::Identity();
+    upright_transform.translation() = translation;
+    upright_transform.linear() = Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+
+    pcl::PointXYZ min_pt, max_pt;
+    pcl::getMinMax3D(*model_cloud, min_pt, max_pt);
+    upright_transform.translation().z() = -min_pt.z;
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr best_aligned_model(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::transformPointCloud(*model_cloud, *best_aligned_model, upright_transform);
+
+    sensor_msgs::PointCloud2 aligned_msg;
+    pcl::toROSMsg(*best_aligned_model, aligned_msg);
+    aligned_msg.header.frame_id = base_frame_;
+    aligned_msg.header.stamp = ros::Time::now();
+    trash_can_pub_.publish(aligned_msg);
+
+    visualization_msgs::MarkerArray marker_array;
+    ros::Time stamp = ros::Time::now();
+
+    if (!best_cluster->points.empty()) {
+        visualization_msgs::Marker marker;
+        marker.header.frame_id = base_frame_;
+        marker.header.stamp = stamp;
+        marker.ns = "trash_can";
+        marker.id = 0;
+        marker.type = visualization_msgs::Marker::CYLINDER;
+        marker.action = visualization_msgs::Marker::ADD;
+
+        marker.pose.position.x = upright_transform.translation().x();
+        marker.pose.position.y = upright_transform.translation().y();
+        marker.pose.position.z = trash_can_height_ / 2.0;
+
+        Eigen::Quaternionf quat(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()));
+        marker.pose.orientation.x = quat.x();
+        marker.pose.orientation.y = quat.y();
+        marker.pose.orientation.z = quat.z();
+        marker.pose.orientation.w = quat.w();
+
+        marker.scale.z = trash_can_height_;
+        marker.scale.x = marker.scale.y = (trash_can_bottom_radius_ + trash_can_top_radius_);
+
+        double threshold_good = 0.005;
+        double threshold_bad = 0.05;
+        double ratio = std::min(1.0, std::max(0.0, (best_fitness - threshold_good) / (threshold_bad - threshold_good)));
+        marker.color.r = ratio;
+        marker.color.g = 1.0 - ratio;
+        marker.color.b = 0.0;
+        marker.color.a = 0.8;
 
         marker_array.markers.push_back(marker);
     }

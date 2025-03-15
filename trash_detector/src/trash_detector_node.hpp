@@ -11,12 +11,16 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
+#include <Eigen/Dense>
+
 class TrashDetector
 {
 public:
     TrashDetector(ros::NodeHandle& nh);
     bool serviceCallback(trash_detector_interfaces::DetectTrash::Request& req,
                          trash_detector_interfaces::DetectTrash::Response& res);
+    bool trashCanServiceCallback(trash_detector_interfaces::DetectTrash::Request& req,
+                                 trash_detector_interfaces::DetectTrash::Response& res);
 private:
     void cloudCallback(const sensor_msgs::PointCloud2ConstPtr& cloud_msg);
     void loadParameters();
@@ -24,7 +28,9 @@ private:
     ros::NodeHandle nh_;
     ros::Subscriber cloud_sub_;
     ros::ServiceServer service_srv_;
+    ros::ServiceServer trash_can_srv_;
     ros::Publisher marker_pub_;
+    ros::Publisher trash_can_pub_;
 
     sensor_msgs::PointCloud2::ConstPtr latest_cloud_;
 
@@ -46,6 +52,15 @@ private:
     // Final filter parameters
     double min_side_length_, max_side_length_;
     double min_height_, max_height_;
+
+    // trash can dimensions 
+    double trash_can_height_;
+    double trash_can_bottom_radius_;
+    double trash_can_top_radius_;
+
+    // ICP parameters for trash can detection
+    int icp_max_iterations_;
+    double icp_transformation_epsilon_;
 
     // TF2 buffer and listener for transformations
     tf2_ros::Buffer tf_buffer_;
