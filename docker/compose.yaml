@@ -1,0 +1,18 @@
+services:
+  trash_detector:
+    container_name: trash_detector
+    image: trash_detector
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      ROS_IP: $ROS_IP
+      ROS_HOSTNAME: $ROS_HOSTNAME
+      ROS_MASTER_URI: $ROS_MASTER_URI
+    network_mode: host
+    stdin_open: true
+    privileged: true
+    tty: true
+    volumes:
+      - ../trash_detector/launch:/root/catkin_ws/src/trash_detector/launch
+      - ../trash_detector/config:/root/catkin_ws/src/trash_detector/config

@@ -1,0 +1,5 @@
+<launch>
+  <node pkg="trash_detector" type="trash_detector_node" name="trash_detector_node" output="screen">
+    <rosparam file="$(find trash_detector)/config/params.yaml" command="load" />
+  </node>
+</launch>
