@@ -60,4 +60,4 @@ icp:
   # It is defined as the fraction of source points (transformed model) that must have a
   # correspondence in the target cluster within the current correspondence distance.
   # For example, a value of 0.1 means at least 10% of the source points must match.
-  threshold: 0.1
+  min_threshold: 0.1
