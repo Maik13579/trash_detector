@@ -23,6 +23,7 @@ double computeInlierRatio(const pcl::PointCloud<pcl::PointXYZ>::Ptr &source,
     pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
     kdtree.setInputCloud(target);
     int inlierCount = 0;
+    double threshold_sqr = threshold * threshold;
     for (const auto &pt : source->points)
     {
         std::vector<int> idx;
@@ -30,7 +31,7 @@ double computeInlierRatio(const pcl::PointCloud<pcl::PointXYZ>::Ptr &source,
         if (kdtree.nearestKSearch(pt, 1, idx, dists) > 0)
         {
             // dists are squared distances.
-            if (dists[0] < threshold * threshold)
+            if (dists[0] < threshold_sqr)
                 inlierCount++;
         }
     }
