@@ -7,11 +7,35 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/common/transforms.h>
 #include <pcl/registration/icp.h>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <Eigen/Dense>
 #include <tf2_eigen/tf2_eigen.h>
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
+
+// Helper function to compute the inlier ratio (percent of source points with a correspondence)
+// using a given threshold (in meters). Distances are squared in the kdtree search.
+double computeInlierRatio(const pcl::PointCloud<pcl::PointXYZ>::Ptr &source,
+                          const pcl::PointCloud<pcl::PointXYZ>::Ptr &target,
+                          double threshold)
+{
+    pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+    kdtree.setInputCloud(target);
+    int inlierCount = 0;
+    for (const auto &pt : source->points)
+    {
+        std::vector<int> idx;
+        std::vector<float> dists;
+        if (kdtree.nearestKSearch(pt, 1, idx, dists) > 0)
+        {
+            // dists are squared distances.
+            if (dists[0] < threshold * threshold)
+                inlierCount++;
+        }
+    }
+    return static_cast<double>(inlierCount) / static_cast<double>(source->points.size());
+}
 
 TrashDetector::TrashDetector(ros::NodeHandle &nh)
     : nh_(nh), tf_listener_(tf_buffer_)
@@ -29,6 +53,10 @@ void TrashDetector::loadParameters()
     ros::NodeHandle pnh("~");
     pnh.param<std::string>("base_frame", base_frame_, "base_link");
 
+    // Base frame for transformations.
+    pnh.param<std::string>("base_frame", base_frame_, "base_link");
+
+    // Bounding box parameters to crop the input point cloud.
     pnh.param("bounding_box/min_x", bb_min_x_, -5.0);
     pnh.param("bounding_box/max_x", bb_max_x_, 5.0);
     pnh.param("bounding_box/min_y", bb_min_y_, -5.0);
@@ -36,27 +64,39 @@ void TrashDetector::loadParameters()
     pnh.param("bounding_box/min_z", bb_min_z_, -1.0);
     pnh.param("bounding_box/max_z", bb_max_z_, 2.0);
 
+    // RANSAC parameters for floor removal.
     pnh.param("ransac/use_ransac", use_ransac_, true);
     pnh.param("ransac/distance_threshold", ransac_distance_threshold_, 0.02);
     pnh.param("ransac/max_iterations", ransac_max_iterations_, 100);
 
+    // Euclidean clustering parameters.
     pnh.param("clustering/cluster_tolerance", cluster_tolerance_, 0.02);
     pnh.param("clustering/min_cluster_size", min_cluster_size_, 50);
     pnh.param("clustering/max_cluster_size", max_cluster_size_, 10000);
 
-    pnh.param("final_filter/min_side_length", min_side_length_, 0.1);
-    pnh.param("final_filter/max_side_length", max_side_length_, 2.0);
-    pnh.param("final_filter/min_height", min_height_, 0.1);
-    pnh.param("final_filter/max_height", max_height_, 2.0);
+    // Trash filter dimensions for valid objects.
+    pnh.param("trash_filter/min_side_length", min_side_length_, 0.1);
+    pnh.param("trash_filter/max_side_length", max_side_length_, 2.0);
+    pnh.param("trash_filter/min_height", min_height_, 0.1);
+    pnh.param("trash_filter/max_height", max_height_, 2.0);
 
-    // Trash can detection parameters
+    // Trash can detection parameters.
     pnh.param("trash_can/height", trash_can_height_, 1.0);
     pnh.param("trash_can/bottom_radius", trash_can_bottom_radius_, 0.2);
     pnh.param("trash_can/top_radius", trash_can_top_radius_, 0.3);
+    pnh.param("trash_can/num_layers", num_layers_, 20);             // Layers along height.
+    pnh.param("trash_can/points_per_layer", points_per_layer_, 36);   // Points per layer.
 
-    // ICP parameters for trash can detection
+    // ICP parameters for trash can detection.
     pnh.param("icp/max_iterations", icp_max_iterations_, 50);
     pnh.param("icp/transformation_epsilon", icp_transformation_epsilon_, 1e-8);
+    std::vector<double> icp_corr_distances;
+    if (!pnh.getParam("icp/corr_distances", icp_corr_distances)) {
+        // Default values if the parameter isn't set.
+        icp_corr_distances = {0.3, 0.1, 0.05, 0.02};
+    }
+    icp_corr_distances_ = icp_corr_distances;
+    pnh.param("icp/min_threshold", icp_threshold_, 0.1);
 }
 
 void TrashDetector::cloudCallback(const sensor_msgs::PointCloud2ConstPtr& cloud_msg)
@@ -353,31 +393,34 @@ bool TrashDetector::trashCanServiceCallback(trash_detector_interfaces::DetectTra
         }
     }
 
-    double best_fitness = std::numeric_limits<double>::max();
+    // Initialize variables to store the best alignment result.
+    double best_ratio = -1.0;
     Eigen::Matrix4f best_transform = Eigen::Matrix4f::Identity();
     pcl::PointCloud<pcl::PointXYZ>::Ptr best_cluster(new pcl::PointCloud<pcl::PointXYZ>());
     
-    std::vector<double> icp_corr_distances = {0.3, 0.1, 0.05, 0.02};
-    
+    // Use the list of ICP correspondence distances.
+    std::vector<double> icp_corr_distances = icp_corr_distances_;
+
+    // Iterate over each cluster and perform multi-scale ICP alignment.
     for (const auto& indices : cluster_indices) {
         pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>());
         pcl::copyPointCloud(*no_floor_cloud, indices, *cluster);
         if (cluster->empty())
             continue;
     
-        // Initial centroid alignment, ensuring trashcan base on ground (z=0)
+        // Align the cluster's centroid with the trash can base (z = 0).
         Eigen::Vector4f centroid;
         pcl::compute3DCentroid(*cluster, centroid);
-        centroid[2] = 0.0;  // Trashcan stands on the ground
+        centroid[2] = 0.0;
         Eigen::Matrix4f transform_icp = Eigen::Matrix4f::Identity();
         transform_icp.block<3,1>(0,3) = centroid.head<3>();
     
         pcl::PointCloud<pcl::PointXYZ>::Ptr model_cloud_transformed(new pcl::PointCloud<pcl::PointXYZ>());
         pcl::transformPointCloud(*model_cloud, *model_cloud_transformed, transform_icp);
     
-        // Multi-scale ICP loop
+        // Multi-scale ICP loop using inlier ratio as metric.
         Eigen::Matrix4f accumulated_transform = Eigen::Matrix4f::Identity();
-        double fitness = std::numeric_limits<double>::max();
+        double current_ratio = 0.0;
         bool converged = true;
     
         for (double corr_dist : icp_corr_distances) {
@@ -396,42 +439,53 @@ bool TrashDetector::trashCanServiceCallback(trash_detector_interfaces::DetectTra
                 break;
             }
     
-            fitness = icp.getFitnessScore();
+            // Update the accumulated transform.
             accumulated_transform = icp.getFinalTransformation() * accumulated_transform;
             pcl::transformPointCloud(*model_cloud_transformed, *model_cloud_transformed, icp.getFinalTransformation());
+    
+            // Compute inlier ratio: percentage of source points (transformed model) with a correspondence in the cluster.
+            current_ratio = computeInlierRatio(model_cloud_transformed, cluster, corr_dist);
         }
     
-        if (converged && fitness < best_fitness) {
-            best_fitness = fitness;
+        // Keep the best alignment (highest inlier ratio).
+        if (converged && current_ratio > best_ratio) {
+            best_ratio = current_ratio;
             best_cluster = cluster;
             best_transform = accumulated_transform * transform_icp;
         }
     }
+
+    if (best_ratio < icp_threshold_) {
+        ROS_INFO("No trash can detected.");
+        return false;
+    }
     
+    // Force trash can upright (remove tilt) and place on the floor.
     Eigen::Vector3f translation = best_transform.block<3,1>(0,3);
     Eigen::Matrix3f rotation = best_transform.block<3,3>(0,0);
-    float yaw = rotation.eulerAngles(0, 1, 2)[2];  // yaw from rotation around Z
-
+    float yaw = rotation.eulerAngles(0, 1, 2)[2];
+    
     Eigen::Affine3f upright_transform = Eigen::Affine3f::Identity();
     upright_transform.translation() = translation;
     upright_transform.linear() = Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()).toRotationMatrix();
-
+    
     pcl::PointXYZ min_pt, max_pt;
     pcl::getMinMax3D(*model_cloud, min_pt, max_pt);
     upright_transform.translation().z() = -min_pt.z;
-
+    
     pcl::PointCloud<pcl::PointXYZ>::Ptr best_aligned_model(new pcl::PointCloud<pcl::PointXYZ>());
     pcl::transformPointCloud(*model_cloud, *best_aligned_model, upright_transform);
-
+    
     sensor_msgs::PointCloud2 aligned_msg;
     pcl::toROSMsg(*best_aligned_model, aligned_msg);
     aligned_msg.header.frame_id = base_frame_;
     aligned_msg.header.stamp = ros::Time::now();
     trash_can_pub_.publish(aligned_msg);
-
+    
+    // Create a cylinder marker for visualizing the trash can.
     visualization_msgs::MarkerArray marker_array;
     ros::Time stamp = ros::Time::now();
-
+    
     if (!best_cluster->points.empty()) {
         visualization_msgs::Marker marker;
         marker.header.frame_id = base_frame_;
@@ -440,36 +494,33 @@ bool TrashDetector::trashCanServiceCallback(trash_detector_interfaces::DetectTra
         marker.id = 0;
         marker.type = visualization_msgs::Marker::CYLINDER;
         marker.action = visualization_msgs::Marker::ADD;
-
+    
         marker.pose.position.x = upright_transform.translation().x();
         marker.pose.position.y = upright_transform.translation().y();
-        marker.pose.position.z = trash_can_height_ / 2.0;
-
+        marker.pose.position.z = trash_can_height_ / 2.0; // Grounded on the floor.
+    
         Eigen::Quaternionf quat(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()));
         marker.pose.orientation.x = quat.x();
         marker.pose.orientation.y = quat.y();
         marker.pose.orientation.z = quat.z();
         marker.pose.orientation.w = quat.w();
-
+    
         marker.scale.z = trash_can_height_;
         marker.scale.x = marker.scale.y = (trash_can_bottom_radius_ + trash_can_top_radius_);
-
-        double threshold_good = 0.005;
-        double threshold_bad = 0.05;
-        double ratio = std::min(1.0, std::max(0.0, (best_fitness - threshold_good) / (threshold_bad - threshold_good)));
-        marker.color.r = ratio;
-        marker.color.g = 1.0 - ratio;
+    
+        // Color the marker based on the best inlier ratio.
+        marker.color.r = 1.0 - best_ratio;
+        marker.color.g = best_ratio;
         marker.color.b = 0.0;
         marker.color.a = 0.8;
-
+    
         marker_array.markers.push_back(marker);
     }
-
+    
     marker_pub_.publish(marker_array);
     res.markers = marker_array;
     return true;
 }
-
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "trash_detector_node");

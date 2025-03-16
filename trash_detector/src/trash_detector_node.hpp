@@ -57,10 +57,14 @@ private:
     double trash_can_height_;
     double trash_can_bottom_radius_;
     double trash_can_top_radius_;
+    int num_layers_;        // Layers along height.
+    int points_per_layer_;
 
     // ICP parameters for trash can detection
     int icp_max_iterations_;
     double icp_transformation_epsilon_;
+    std::vector<double> icp_corr_distances_;
+    double icp_threshold_;
 
     // TF2 buffer and listener for transformations
     tf2_ros::Buffer tf_buffer_;

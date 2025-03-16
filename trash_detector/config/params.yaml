@@ -1,28 +1,63 @@
-base_frame: "base_footprint"
-bounding_box:
+
+# Base frame used for transforming point clouds.
+# Z must point upwards and floor must be at z=0.0
+base_frame: "base_footprint" #tf to this frame has to be available
+
+# Bounding box parameters for cropping the input point cloud.
+bounding_box: # in $base_frame
   min_x: 0.0
   max_x: 5.0
   min_y: -3.0
   max_y: 3.0
   min_z: -1.0
   max_z: 1.0
-ransac: # disable ransac of bounding box excludes the ground already
-  use_ransac: true
-  distance_threshold: 0.01
-  max_iterations: 100
+
+# RANSAC parameters for floor segmentation.
+ransac:
+  use_ransac: true           # Whether to use RANSAC for floor segmentation.
+  distance_threshold: 0.01   # Distance [m] threshold for considering a point as part of the plane.
+  max_iterations: 100        # Maximum number of iterations for RANSAC.
+ 
+# Euclidean clustering parameters for object segmentation.
 clustering:
-  cluster_tolerance: 0.02
-  min_cluster_size: 20
-  max_cluster_size: 1000000
-final_filter:
-  min_side_length: 0.01
-  max_side_length: 0.4
-  min_height: 0.02
-  max_height: 0.2
+  cluster_tolerance: 0.02    # Maximum distance [m] between points in a cluster.
+  min_cluster_size: 20       # Minimum number of points required for a valid cluster.
+  max_cluster_size: 1000000  # Maximum number of points allowed in a cluster.
+
+# Filtering parameters (for trash and trash_can detection).
+#################################################################
+# Trash detection parameters.
+
+# Trash filter dimensions for validating detected clusters.
+trash_filter:
+  min_side_length: 0.01       # Minimum allowed side length [m] for the cluster's bounding box.
+  max_side_length: 0.4        # Maximum allowed side length [m] for the cluster's bounding box.
+  min_height: 0.02            # Minimum allowed height [m] for a cluster.
+  max_height: 0.2             # Maximum allowed height [m] for a cluster.
+
+# Trash detection parameters.
+###################################################################
+# TrashCan detection parameters.
+
+# Trash can dimension for generating synthetic model.
 trash_can:
-  height: 0.33
-  bottom_radius: 0.15
-  top_radius: 0.18
+  height: 0.33                # Expected height [m] of the trash can.
+  bottom_radius: 0.15         # Expected radius [m] at the bottom of the trash can.
+  top_radius: 0.18            # Expected radius [m] at the top of the trash can.
+  
+  # The next two params are used to generate the synthetic model.
+  # We create $num_layers circles (bewteen $bottom_radius and $top_radius) along the trash can's height.
+  # On each circle, we generate $points_per_layer evenly distributed points.
+  num_layers: 20              # Number of layers along the trash can's height.
+  points_per_layer: 36        # Number of points per layer for the synthetic model.
+
+# ICP parameters for aligning the trash can model.
 icp:
-  max_iterations: 100
-  transformation_epsilon: 1e-8
+  max_iterations: 100         # Maximum iterations for ICP alignment.
+  transformation_epsilon: 1e-8 # Convergence threshold for ICP transformations.
+  corr_distances: [0.3, 0.1, 0.05, 0.02] # List of correspondence distances [m] for multi-scale ICP.
+  # The 'min_threshold' parameter represents the minimum acceptable inlier ratio.
+  # It is defined as the fraction of source points (transformed model) that must have a
+  # correspondence in the target cluster within the current correspondence distance.
+  # For example, a value of 0.1 means at least 10% of the source points must match.
+  threshold: 0.1
